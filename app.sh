@@ -21,7 +21,7 @@ pkill -f app.py     2>/dev/null && echo "Killed existing app.py processes."
 # 3) Show the Domino proxy URL
 if [ -n "${DOMINO_RUN_HOST_PATH:-}" ]; then
   CLEAN=$(echo "$DOMINO_RUN_HOST_PATH" | sed 's|/r||g')
-  URL="https://se-demo.domino.tech${CLEAN}proxy/${PORT}/"
+  URL="https://fitch.domino-eval.com${CLEAN}proxy/${PORT}/"
   echo "========================================="
   echo "Flask URL: $URL"
   echo "========================================="
