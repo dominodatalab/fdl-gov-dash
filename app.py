@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger('werkzeug').setLevel(logging.INFO)
 logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
 
-DOMINO_DOMAIN = os.environ.get("DOMINO_DOMAIN", "fitch.domino-v")
+DOMINO_DOMAIN = os.environ.get("DOMINO_DOMAIN", "fitch.domino-eval.com")
 DOMINO_API_KEY = os.environ.get("DOMINO_USER_API_KEY", "")
 
 logger.info(f"DOMINO_DOMAIN: {DOMINO_DOMAIN}")

@@ -180,6 +180,7 @@ async function handleSecurityScan(modelName, modelVersion, buttonElement) {
 
 
 // API Functions
+// Updated API Functions - fetch both drafts AND results
 async function fetchAllData() {
     try {
         // 1. Fetch bundles via proxy
@@ -188,10 +189,10 @@ async function fetchAllData() {
         if (!bundlesResponse.ok) throw new Error(`Bundles API: ${bundlesResponse.status}`);
         const bundlesData = await bundlesResponse.json();
         
-        // Filter bundles with fitch policies
+        // Filter bundles with policies
         const filteredBundles = bundlesData.data?.filter(bundle => 
             bundle.state !== 'Archived' && 
-            bundle.policies?.some(policy => policy.policyName?.toLowerCase().includes('[fitch'))
+            bundle.policies?.some(policy => policy.policyName?.toLowerCase().includes(''))
         ) || [];
 
         appState.bundles = filteredBundles;
@@ -216,13 +217,28 @@ async function fetchAllData() {
             }
         });
 
-        // 4. Fetch all evidence in parallel via proxy
+        // 4. Fetch BOTH drafts and results in parallel
         const evidencePromises = filteredBundles.map(async bundle => {
             try {
-                const response = await proxyFetch(`api/governance/v1/drafts/latest?bundleId=${bundle.id}`);
-                if (response.ok) {
-                    appState.evidence[bundle.id] = await response.json();
-                }
+                // Fetch drafts - use bundleID (capital I, capital D)
+                const draftsResponse = await proxyFetch(`api/governance/v1/drafts/latest?bundleID=${bundle.id}`);
+                const drafts = draftsResponse.ok ? await draftsResponse.json() : null;
+                
+                // Fetch results - use bundleID (capital I, capital D)
+                const resultsResponse = await proxyFetch(`api/governance/v1/results/latest?bundleID=${bundle.id}`);
+                const results = resultsResponse.ok ? await resultsResponse.json() : null;
+                
+                // Merge drafts and results
+                // Results take precedence (they're published), drafts are fallback
+                const merged = mergeEvidenceData(drafts, results);
+                appState.evidence[bundle.id] = merged;
+                
+                console.log(`Bundle ${bundle.id}:`, {
+                    draftsCount: drafts?.length || 0,
+                    resultsCount: results?.length || 0,
+                    mergedCount: merged?.length || 0
+                });
+                
             } catch (err) {
                 console.error(`Evidence ${bundle.id} failed:`, err);
             }
@@ -240,185 +256,203 @@ async function fetchAllData() {
     }
 }
 
-// Data Processing - enhanced to capture experiment IDs
-async function processData() {
-    appState.models = {};
-    appState.tableData = [];
+// Helper function to merge drafts and results
+function mergeEvidenceData(drafts, results) {
+    // Create a map for quick lookup
+    const evidenceMap = new Map();
+    
+    // Add drafts first
+    if (Array.isArray(drafts)) {
+        drafts.forEach(draft => {
+            // Use evidenceId as the key
+            evidenceMap.set(draft.evidenceId, {
+                ...draft,
+                source: 'draft'
+            });
+        });
+    }
+    
+    // Override/add results (results are published, so they take precedence)
+    if (Array.isArray(results)) {
+        results.forEach(result => {
+            // Results use 'artifactId' instead of 'evidenceId' sometimes
+            const key = result.evidenceId || result.artifactId;
+            
+            // If we already have a draft for this evidence, check timestamps
+            const existing = evidenceMap.get(key);
+            if (existing) {
+                // Results are newer/published, so they win
+                evidenceMap.set(key, {
+                    ...result,
+                    source: 'result',
+                    // Keep draft data if result is missing some fields
+                    artifactContent: result.artifactContent || existing.artifactContent
+                });
+            } else {
+                // New result not in drafts
+                evidenceMap.set(key, {
+                    ...result,
+                    source: 'result'
+                });
+            }
+        });
+    }
+    
+    // Convert back to array
+    return Array.from(evidenceMap.values());
+}
 
-    // Process each bundle to extract model data
+// Update the processData function to handle the merged evidence
+async function processData() {
+    appState.tableData = [];
+    console.log('Processing bundles...');
+
     for (const bundle of appState.bundles) {
+        const attachmentModels = [];
+        const bundleEvidence = appState.evidence[bundle.id] || [];
+        const bundleEvidenceMap = {};
+
+        // Map evidence by external ID for quick lookup
+        if (Array.isArray(bundleEvidence)) {
+            bundleEvidence.forEach(evidence => {
+                const externalId = getEvidenceExternalId(evidence, bundle.policies);
+                if (externalId) {
+                    bundleEvidenceMap[externalId] = evidence;
+                }
+            });
+        }
+        
+        // Log to see what data source we're using
+        console.log(`Bundle ${bundle.name} evidence sources:`, 
+            bundleEvidence.map(e => e.source).filter((v, i, a) => a.indexOf(v) === i)
+        );
+        // Collect model info from attachments
         for (const attachment of bundle.attachments || []) {
             if (attachment.type === 'ModelVersion' && attachment.identifier) {
-                const modelKey = `${attachment.identifier.name}_v${attachment.identifier.version}`;
-                
-                // Initialize model data structure
-                if (!appState.models[modelKey]) {
-                    appState.models[modelKey] = {
-                        modelName: attachment.identifier.name,
-                        dominoModelName: attachment.identifier.name,
-                        modelVersion: attachment.identifier.version,
-                        modelKey: modelKey,
-                        bundles: [],
-                        evidence: [],
-                        policies: [],
-                        experimentId: null, // Add experiment ID
-                        systemId: null,
-                        applicationId: null,
-                        applicationType: null,
-                        significanceRisk: null,
-                        usageRisk: null,
-                        complexityRisk: null,
-                        userType: null,
-                        outputAuthorization: null,
-                        expiryDate: null,
-                        securityClassification: null,
-                        euAIActRisk: null,
-                        modelHealth: null
-                    };
-                }
-
-                const model = appState.models[modelKey];
-
-                // Get experiment ID from the registered model
-                try {
-                    const modelResponse = await proxyFetch(`api/registeredmodels/v1/${attachment.identifier.name}/versions/${attachment.identifier.version}`);
-                    if (modelResponse.ok) {
-                        const modelDetails = await modelResponse.json();
-                        model.experimentId = modelDetails.experimentRunId;
-                    }
-                } catch (error) {
-                    console.error(`Failed to fetch experiment ID for ${modelKey}:`, error);
-                }
-
-                // Add bundle info
-                model.bundles.push({
-                    bundleId: bundle.id,
-                    bundleName: bundle.name,
-                    bundleState: bundle.state,
-                    createdAt: bundle.createdAt
-                });
-
-                // Process evidence for this bundle
-                const bundleEvidence = appState.evidence[bundle.id] || [];
-                if (Array.isArray(bundleEvidence)) {
-                    bundleEvidence.forEach(evidence => {
-                        const externalId = getEvidenceExternalId(evidence, bundle.policies);
-
-                        if (externalId === 'system-name') {
-                            model.modelName = evidence.artifactContent;
-                        }
-                        
-                        // Find system-id evidence
-                        if (externalId === 'system-id') {
-                            model.systemId = evidence.artifactContent;
-                            model.applicationId = `v${evidence.artifactContent}.${model.modelVersion}`;
-                        }
-                        
-                        // Find application-type evidence
-                        if (externalId === 'application-type') {
-                            model.applicationType = evidence.artifactContent;
-                        }
-
-                        if (externalId === 'service-level') {
-                            model.serviceLevel = evidence.artifactContent;
-                        }
-
-                        if (externalId === 'significance') {
-                            model.significanceRisk = evidence.artifactContent;
-                        }
-
-                        if (externalId === 'usage') {
-                            model.usageRisk = evidence.artifactContent;
-                        }
-
-                        if (externalId === 'complexity') {
-                            model.complexityRisk = evidence.artifactContent;
-                        }
-
-                        if (externalId === 'user-type') {
-                            model.userType = evidence.artifactContent;
-                        }
-
-                        if (externalId === 'output-authorization') {
-                            model.outputAuthorization = evidence.artifactContent;
-                        }
-
-                        if (externalId === 'expiry-date') {
-                            model.expiryDate = evidence.artifactContent;
-                        }
-
-                        if (externalId === 'Security-Classification-wa39') {
-                            model.securityClassification = evidence.artifactContent;
-                        }
-
-                        if (externalId === 'eu-ai-act-risk-level') {
-                            model.euAIActRisk = evidence.artifactContent;
-                        }
-
-                        if (externalId === 'Model-Upload-and-Health-zGg') {
-                            model.modelHealth = ((() => {
-                              const r = evidence.artifactContent?.[0]?.["model health"];
-                              if (typeof r === 'number') return r;
-                              if (r && typeof r === 'object') return r.value ?? r.health ?? 0;
-                              if (typeof r === 'string') {
-                                const m = r.match(/-?\d+(\.\d+)?/);              // handles "health: 0.9679"
-                                if (m) return parseFloat(m[0]);
-                                try { const o = JSON.parse(r); return o.value ?? o.health ?? 0; } catch { return 0; }
-                              }
-                              return 0;
-                            })() * 100).toFixed(2) + '%';
-                        }
-                        
-                        model.evidence.push({
-                            ...evidence,
-                            bundleId: bundle.id,
-                            bundleName: bundle.name
-                        });
-                    });
-                }
-
-                // Add policies
-                bundle.policies?.forEach(policy => {
-                    model.policies.push({
-                        ...policy,
-                        bundleId: bundle.id,
-                        fullPolicyData: appState.policies[policy.policyId] || null
-                    });
+                attachmentModels.push({
+                    name: attachment.identifier.name,
+                    version: attachment.identifier.version
                 });
             }
         }
+        const modelHallucinationKey = Object.keys(bundleEvidenceMap).find(k => k.includes("Model-Upload-and-Hallucination"));
+        const modelHallucination = extractModelHallucination(bundleEvidenceMap[modelHallucinationKey]?.artifactContent);
+
+        // Extract metadata from evidence (same as before)
+        const metadata = {
+            applicationId: bundleEvidenceMap['system-id']?.artifactContent || null,
+            systemName: bundleEvidenceMap['system-name']?.artifactContent || null,
+            modelName: bundleEvidenceMap['system-name']?.artifactContent || null,
+            applicationType: bundleEvidenceMap['application-type']?.artifactContent || null,
+            serviceLevel: bundleEvidenceMap['service-level']?.artifactContent || null,
+            significanceRisk: bundleEvidenceMap['significance']?.artifactContent?.label || null,
+            usageRisk: bundleEvidenceMap['usage']?.artifactContent?.label || null,
+            complexityRisk: bundleEvidenceMap['complexity']?.artifactContent?.label || null,
+            userType: bundleEvidenceMap['user-type']?.artifactContent || null,
+            outputAuthorization: bundleEvidenceMap['output-authorization']?.artifactContent || null,
+            expiryDate: bundleEvidenceMap['expiry-date']?.artifactContent || null,
+            securityClassification: bundleEvidenceMap['Security-Classification-wa39']?.artifactContent || null,
+            euAIActRisk: bundleEvidenceMap['eu-ai-act-risk-level']?.artifactContent || null,
+            modelHealth: modelHallucination || null,
+        };
+
+        // Collect QA and approval data
+        const qaData = {
+            approvalsCount: bundle.stageApprovals?.length || 0,
+            commentsCount: bundle.commentsCount || 0,
+            approvals: bundle.stageApprovals || []
+        };
+
+        // Build bundle row data
+        const bundleRowData = {
+            bundleId: bundle.id,
+            bundleName: bundle.name,
+            bundleState: bundle.state,
+            bundleCreatedAt: bundle.createdAt,
+            bundleCreatedBy: bundle.createdBy?.name || 'Unknown',
+            projectName: bundle.projectName || 'Unknown',
+            projectOwner: bundle.projectOwner || 'Unknown',
+            policyName: bundle.policyName || 'Unknown',
+            policyId: bundle.policyId,
+            
+            // Attachments (models)
+            attachmentModels: attachmentModels,
+            modelNames: attachmentModels.map(m => m.name).join(', ') || 'N/A',
+            modelVersions: attachmentModels.map(m => m.version).join(', ') || 'N/A',
+            
+            // Metadata
+            ...metadata,
+            
+            // QA & Approvals
+            ...qaData,
+            
+            // Raw data for potential future use
+            policies: bundle.policies || [],
+            evidence: bundleEvidence,
+            gates: bundle.gates || [],
+            stages: bundle.stages || []
+        };
+
+        if (
+          bundleRowData.modelName &&
+          typeof bundleRowData.modelName === 'string' &&
+          bundleRowData.modelName.trim() !== '' &&
+          bundleRowData.modelName.toLowerCase() !== 'unknown'
+        ) {
+          appState.tableData.push(bundleRowData);
+        }
+        console.log('Bundle Row Data:', bundleRowData);
     }
 
-    // Create table data - include experiment ID
-    appState.tableData = Object.values(appState.models).map(model => ({
-        modelName: model.modelName,
-        modelVersion: model.modelVersion,
-        dominoModelName: model.dominoModelName,
-        applicationId: model.applicationId || `n/a`,
-        applicationType: model.applicationType || 'Unknown',
-        serviceLevel: model.serviceLevel || 'Unknown',
-        significanceRisk: model.significanceRisk || 'n/a',
-        usageRisk: model.usageRisk || 'n/a',
-        complexityRisk: model.complexityRisk || 'n/a',
-        userType: model.userType || 'n/a',
-        outputAuthorization: model.outputAuthorization || 'n/a',
-        expiryDate: model.expiryDate || 'n/a',
-        securityClassification: model.securityClassification || 'n/a',
-        euAIActRisk: model.euAIActRisk || 'n/a',
-        modelHealth: model.modelHealth || 'n/a',
-        bundleName: model.bundles[0]?.bundleName || 'Unknown',
-        bundleId: model.bundles[0]?.bundleId || null,
-        evidenceStatus: model.evidence[0]?.evidenceId || '-',
-        evidenceCreated: model.evidence[0]?.updatedAt || '-',
-        owner: model.evidence[0]?.userId || 'Unknown',
-        createdAt: model.bundles[0]?.createdAt,
-        experimentId: model.experimentId, // Include experiment ID
-        findings: [],
-        dependencies: [],
-    }));
-
-    console.log('Data processed:', { models: appState.models, tableData: appState.tableData });
+    console.log('All bundles processed:', {
+        totalBundles: appState.tableData.length,
+        tableData: appState.tableData
+    });
 }
+
+// Helper function to extract model health
+function extractModelHallucination(hallucinationContent) {
+  if (!hallucinationContent) return null;
+
+  try {
+    // Case 1: It's an array of objects with a "Hallucination Score" field
+    if (Array.isArray(hallucinationContent)) {
+      for (const item of hallucinationContent) {
+        const raw = item?.["Hallucination Score"];
+        if (!raw) continue;
+
+        // If it’s JSON, parse it and extract numeric value
+        try {
+          const parsed = JSON.parse(raw);
+          if (typeof parsed?.value === "number") return parsed.value;
+          if (typeof parsed?.hallucination_score === "number") return parsed.hallucination_score;
+        } catch {
+          // Not JSON — try to extract "hallucination_score: 0.08" pattern
+          const match = raw.match(/([0-9]*\.?[0-9]+)/);
+          if (match) return parseFloat(match[1]);
+        }
+      }
+    }
+
+    // Case 2: Plain object directly containing the score
+    if (typeof hallucinationContent === "object" && hallucinationContent !== null) {
+      const val = hallucinationContent.hallucination_score;
+      if (typeof val === "number") return val;
+    }
+
+    // Case 3: Just a string directly
+    if (typeof hallucinationContent === "string") {
+      const match = hallucinationContent.match(/([0-9]*\.?[0-9]+)/);
+      if (match) return parseFloat(match[1]);
+    }
+
+  } catch (err) {
+    console.warn("Failed to extract hallucination score:", err);
+  }
+
+  return null;
+}
+
 
 // Helper function to get evidence external ID
 function getEvidenceExternalId(evidence, bundlePolicies) {
@@ -450,12 +484,12 @@ function renderTable() {
         `;
         return;
     }
-
+    
     tbody.innerHTML = appState.tableData.map((model, index) => `
         <tr>
             <td>
                 <div class="model-name">${model.modelName}</div>
-                <div class="model-type">${model.applicationId}</div>
+                <div class="model-type">ID: ${model.applicationId}</div>
             </td>
             <td><span class="user-name">${model.applicationType}</span></td>
             <td><span class="status-badge status-${model.serviceLevel?.toLowerCase().replace(/\s+/g, '-')}">${model.serviceLevel}</span></td>
@@ -471,7 +505,7 @@ function renderTable() {
             <td><span class="user-name">${model.expiryDate}</span></td>
             <td><span class="user-name">${model.securityClassification}</span></td>
             <td><span class="user-name">${model.euAIActRisk}</span></td>
-            <td><span class="user-name">${model.modelHealth}</span></td>
+            <td><span class="user-name">${model.modelHealth ?? '-'}</span></td>
             <td>
                 <button class="action-btn" onclick="toggleDetails(this, ${index})">
                     <span>Details</span>
@@ -486,12 +520,12 @@ function renderTable() {
                         <h3>Model Details</h3>
                         <div class="detail-grid">
                             <div class="detail-item">
-                                <div class="detail-label">Registered Model Version</div>
-                                <div class="detail-value">${model.modelVersion}</div>
+                                <div class="detail-label">Primary Policy Name</div>
+                                <div class="detail-value">${model.policyName}</div>
                             </div>
                             <div class="detail-item">
-                                <div class="detail-label">Created</div>
-                                <div class="detail-value">${formatDate(model.createdAt)}</div>
+                                <div class="detail-label">Policy ID</div>
+                                <div class="detail-value">${model.policyId}</div>
                             </div>
                             <div class="detail-item">
                                 <div class="detail-label">Bundle</div>
@@ -506,19 +540,10 @@ function renderTable() {
                         </div>
                     </div>
                         <div class="actions-row">
-                            <button class="btn btn-primary" disabled>View Live Model Monitoring</button>
-                            <button class="btn btn-secondary" disabled>View Governing Bundles</button>
-                            
-                            ${model.modelName && model.modelVersion
-                                ? `
-                                    <button class="btn btn-warning security-scan-btn"
-                                        onclick="handleSecurityScan('${model.dominoModelName}', '${model.modelVersion}', this)">
-                                        Run Security Scan
-                                    </button>
-                                `
-                                : '<button class="btn btn-secondary" disabled>No Model Name / Version</button>'
-                            }
-                        </div>
+                            <button class="btn btn-primary" disabled>View Live Model Monitoring (disabled) </button>
+                            <button class="btn btn-secondary" disabled>View Governing Bundles (disabled) </button>
+                            <button class="btn btn-secondary" disabled>Run Security Scan (disabled) / Version</button>
+                    </div>
                 </div>
             </td>
         </tr>
@@ -628,20 +653,3 @@ document.querySelectorAll('.tab').forEach(tab => {
     });
 });
 
-// Search functionality
-const searchBox = document.querySelector('.search-box');
-if (searchBox) {
-    searchBox.addEventListener('input', function(e) {
-        const searchTerm = e.target.value.toLowerCase();
-        const rows = document.querySelectorAll('tbody tr:not(.expandable-row)');
-        
-        rows.forEach(row => {
-            const modelName = row.querySelector('.model-name')?.textContent.toLowerCase() || '';
-            const ownerName = row.querySelector('.user-name')?.textContent.toLowerCase() || '';
-            const matches = modelName.includes(searchTerm) || ownerName.includes(searchTerm);
-            row.style.display = matches ? '' : 'none';
-        });
-    });
-}
-
-console.log('Dashboard initialized');
