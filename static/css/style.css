@@ -260,7 +260,13 @@ tr:last-child td { border-bottom: none; }
   border-radius: 50%; display: grid; place-items: center;
   color: white; font-size: 10px; font-weight: 700;
 }
-.user-name { font-size: var(--fs-12); color: color-mix(in srgb, var(--text) 85%, white); }
+.user-name {
+  font-size: var(--fs-12);
+  color: color-mix(in srgb, var(--text) 85%, white);
+  white-space: pre-wrap; /* Preserve newlines in table cells */
+  word-wrap: break-word;
+  line-height: 1.4;
+}
 
 /* ---------- Metrics ---------- */
 .metric-value { font-weight: 700; font-size: var(--fs-14); }
@@ -408,21 +414,20 @@ button.disabled {
 }
 
 /* Map ranges via data attribute; keep colors semantic */
-.risk-level[data-risk="1"],
-.risk-level[data-risk="2"],
-.risk-level[data-risk="3"],
-.risk-level[data-risk="4"] {
+/* Model Risk Tier: 1 = green (low risk), 2 = orange (medium risk), 3 = red (high risk) */
+.risk-level[data-risk="1"] {
   background: var(--ok-bg); color: var(--ok-fg); border-color: color-mix(in srgb, var(--ok-fg) 20%, transparent);
 }
-.risk-level[data-risk="5"],
-.risk-level[data-risk="6"],
-.risk-level[data-risk="7"] {
+.risk-level[data-risk="2"] {
   background: var(--warn-bg); color: var(--warn-fg); border-color: color-mix(in srgb, var(--warn-fg) 20%, transparent);
 }
-.risk-level[data-risk="8"],
-.risk-level[data-risk="9"],
-.risk-level[data-risk="10"] {
+.risk-level[data-risk="3"] {
   background: var(--stop-bg); color: var(--stop-fg); border-color: color-mix(in srgb, var(--stop-fg) 20%, transparent);
+}
+
+/* Clearance level styling (2 = lower clearance, 3 = higher clearance, none = no clearance) */
+.risk-level[data-risk="none"] {
+  background: var(--subtle-2); color: var(--muted); border-color: var(--border);
 }
 
 /* Security Scan Styles */
@@ -701,4 +706,97 @@ button.disabled {
 
 .expandable-content .actions-row .security-scan-btn {
     margin-left: 10px;
+}
+
+/* ---------- Q/A Display Styles ---------- */
+.qa-container {
+    display: grid;
+    gap: var(--sp-4);
+    margin-top: var(--sp-4);
+}
+
+.qa-item {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    padding: var(--sp-4);
+    transition: all 0.2s ease;
+    box-shadow: var(--shadow-sm);
+}
+
+.qa-item:hover {
+    box-shadow: var(--shadow-md);
+    border-color: color-mix(in srgb, var(--brand) 40%, var(--border));
+    transform: translateY(-1px);
+}
+
+.qa-question {
+    font-size: var(--fs-14);
+    color: var(--brand);
+    margin-bottom: var(--sp-2);
+    font-weight: 600;
+    line-height: 1.5;
+}
+
+.qa-question strong {
+    display: inline-block;
+    background: var(--brand);
+    color: white;
+    padding: 2px 8px;
+    border-radius: var(--r-xs);
+    margin-right: 8px;
+    font-size: var(--fs-11);
+}
+
+.qa-answer {
+    font-size: var(--fs-14);
+    color: var(--text);
+    margin-bottom: var(--sp-2);
+    line-height: 1.6;
+    padding-left: var(--sp-4);
+    border-left: 3px solid var(--accent);
+    white-space: pre-wrap; /* Preserve whitespace and newlines */
+    word-wrap: break-word; /* Break long words if needed */
+}
+
+.qa-answer strong {
+    display: inline-block;
+    background: var(--accent);
+    color: white;
+    padding: 2px 8px;
+    border-radius: var(--r-xs);
+    margin-right: 8px;
+    font-size: var(--fs-11);
+}
+
+.qa-meta {
+    font-size: var(--fs-11);
+    color: var(--muted);
+    padding-left: var(--sp-4);
+    font-style: italic;
+}
+
+.qa-meta small {
+    background: var(--subtle-2);
+    padding: 2px 6px;
+    border-radius: var(--r-xs);
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+}
+
+/* Responsive Q/A grid */
+@media (min-width: 768px) {
+    .qa-container {
+        grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+    }
+}
+
+@media (max-width: 767px) {
+    .qa-item {
+        padding: var(--sp-3);
+    }
+
+    .qa-question,
+    .qa-answer {
+        font-size: var(--fs-12);
+    }
 }

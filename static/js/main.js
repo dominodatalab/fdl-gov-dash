@@ -8,6 +8,10 @@ console.log('using proxy base', DOMINO_API_BASE);
 console.log('proxying to', ORIGINAL_API_BASE);
 const API_KEY = window.DOMINO?.API_KEY || null;
 
+// HARDCODED POLICY ID - Change this to filter by specific policy
+const HARDCODED_POLICY_ID = '10177420-1d88-41f6-a029-60d47f3cd397';
+const HARDCODED_Bundle_ID = '22b345af-651d-4258-ba49-2926829d8908';
+
 // Global state - single source of truth
 let appState = {
     bundles: null,
@@ -15,7 +19,8 @@ let appState = {
     evidence: {},
     models: {},
     tableData: [],
-    securityScans: {} // Store security scan results by experiment ID
+    securityScans: {}, // Store security scan results by experiment ID
+    qaData: {} // Store Q/A dictionaries by bundle ID
 };
 
 // Helper function to make proxy API calls
@@ -189,63 +194,61 @@ async function fetchAllData() {
         if (!bundlesResponse.ok) throw new Error(`Bundles API: ${bundlesResponse.status}`);
         const bundlesData = await bundlesResponse.json();
         
-        // Filter bundles with policies
-        const filteredBundles = bundlesData.data?.filter(bundle => 
-            bundle.state !== 'Archived' && 
-            bundle.policies?.some(policy => policy.policyName?.toLowerCase().includes(''))
+        // Filter bundles by HARDCODED_POLICY_ID
+        const filteredBundles = bundlesData.data?.filter(bundle =>
+            bundle.state !== 'Archived' &&
+            bundle.policies?.some(policy => policy.policyId === HARDCODED_POLICY_ID)
         ) || [];
+
+        console.log(`Filtering by policyId: ${HARDCODED_POLICY_ID}`);
+        console.log(`Found ${filteredBundles.length} bundles matching policy ${HARDCODED_POLICY_ID}`);
 
         appState.bundles = filteredBundles;
 
-        // 2. Collect all policy IDs
-        const policyIds = new Set();
-        filteredBundles.forEach(bundle => {
-            bundle.policies?.forEach(policy => {
-                if (policy.policyId) policyIds.add(policy.policyId);
-            });
-        });
-
-        // 3. Fetch all policies in parallel via proxy
-        const policyPromises = Array.from(policyIds).map(async policyId => {
-            try {
-                const response = await proxyFetch(`api/governance/v1/policies/${policyId}`);
-                if (response.ok) {
-                    appState.policies[policyId] = await response.json();
-                }
-            } catch (err) {
-                console.error(`Policy ${policyId} failed:`, err);
-            }
-        });
-
-        // 4. Fetch BOTH drafts and results in parallel
+        // 2. Use compute-policy endpoint to fetch policy, drafts, and results in one call
         const evidencePromises = filteredBundles.map(async bundle => {
             try {
-                // Fetch drafts - use bundleID (capital I, capital D)
-                const draftsResponse = await proxyFetch(`api/governance/v1/drafts/latest?bundleID=${bundle.id}`);
-                const drafts = draftsResponse.ok ? await draftsResponse.json() : null;
-                
-                // Fetch results - use bundleID (capital I, capital D)
-                const resultsResponse = await proxyFetch(`api/governance/v1/results/latest?bundleID=${bundle.id}`);
-                const results = resultsResponse.ok ? await resultsResponse.json() : null;
-                
-                // Merge drafts and results
-                // Results take precedence (they're published), drafts are fallback
-                const merged = mergeEvidenceData(drafts, results);
-                appState.evidence[bundle.id] = merged;
-                
-                console.log(`Bundle ${bundle.id}:`, {
-                    draftsCount: drafts?.length || 0,
-                    resultsCount: results?.length || 0,
-                    mergedCount: merged?.length || 0
+                // Call compute-policy endpoint with bundleId and policyId
+                const computeResponse = await proxyFetch('api/governance/v1/rpc/compute-policy', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        bundleId: bundle.id,
+                        policyId: HARDCODED_POLICY_ID
+                    })
                 });
-                
+
+                if (!computeResponse.ok) {
+                    throw new Error(`compute-policy failed: ${computeResponse.status}`);
+                }
+
+                const data = await computeResponse.json();
+
+                // Store the policy (includes full evidence definitions)
+                if (data.policy) {
+                    appState.policies[data.policy.id] = data.policy;
+                }
+
+                // Only use results (published evidence), ignore drafts
+                const results = (data.results || []).map(result => ({
+                    ...result,
+                    source: 'result'
+                }));
+                appState.evidence[bundle.id] = results;
+
+                console.log(`Bundle ${bundle.id} (${bundle.name}):`, {
+                    resultsCount: results.length
+                });
+
             } catch (err) {
-                console.error(`Evidence ${bundle.id} failed:`, err);
+                console.error(`compute-policy for bundle ${bundle.id} failed:`, err);
             }
         });
 
-        // Wait for all API calls
-        await Promise.all([...policyPromises, ...evidencePromises]);
+        // Wait for all compute-policy calls
+        await Promise.all(evidencePromises);
 
         console.log('All data fetched:', appState);
         return true;
@@ -256,55 +259,80 @@ async function fetchAllData() {
     }
 }
 
-// Helper function to merge drafts and results
-function mergeEvidenceData(drafts, results) {
-    // Create a map for quick lookup
-    const evidenceMap = new Map();
-    
-    // Add drafts first
-    if (Array.isArray(drafts)) {
-        drafts.forEach(draft => {
-            // Use evidenceId as the key
-            evidenceMap.set(draft.evidenceId, {
-                ...draft,
-                source: 'draft'
-            });
-        });
+// Helper function to extract Q/A dictionary from bundle evidence
+function extractQADictionary(bundleId, bundleEvidence, bundlePolicies) {
+    const qaDict = {};
+
+    if (!Array.isArray(bundleEvidence)) {
+        return qaDict;
     }
-    
-    // Override/add results (results are published, so they take precedence)
-    if (Array.isArray(results)) {
-        results.forEach(result => {
-            // Results use 'artifactId' instead of 'evidenceId' sometimes
-            const key = result.evidenceId || result.artifactId;
-            
-            // If we already have a draft for this evidence, check timestamps
-            const existing = evidenceMap.get(key);
-            if (existing) {
-                // Results are newer/published, so they win
-                evidenceMap.set(key, {
-                    ...result,
-                    source: 'result',
-                    // Keep draft data if result is missing some fields
-                    artifactContent: result.artifactContent || existing.artifactContent
-                });
-            } else {
-                // New result not in drafts
-                evidenceMap.set(key, {
-                    ...result,
-                    source: 'result'
-                });
+
+    // For each evidence item, extract the question and answer
+    bundleEvidence.forEach(evidence => {
+        // Get the external ID which is often the question identifier
+        const externalId = getEvidenceExternalId(evidence, bundlePolicies);
+
+        // Get the question from policy definitions
+        let question = externalId || evidence.evidenceId || 'Unknown';
+
+        // Try to find the actual question text from the policy
+        for (const policy of bundlePolicies || []) {
+            const fullPolicy = appState.policies[policy.policyId];
+            if (!fullPolicy?.stages) continue;
+
+            for (const stage of fullPolicy.stages) {
+                const evidenceDef = stage.evidenceSet?.find(def => def.id === evidence.evidenceId);
+                if (evidenceDef) {
+                    question = evidenceDef.name || evidenceDef.externalId || question;
+                    break;
+                }
             }
-        });
-    }
-    
-    // Convert back to array
-    return Array.from(evidenceMap.values());
+        }
+
+        // Extract the answer from artifactContent
+        let answer = evidence.artifactContent;
+
+        // Format the answer based on type
+        if (answer === null || answer === undefined) {
+            answer = 'N/A';
+        } else if (typeof answer === 'object') {
+            // Handle complex objects
+            if (answer.label) {
+                answer = answer.label;
+            } else if (Array.isArray(answer)) {
+                answer = answer.join(', ');
+            } else {
+                answer = JSON.stringify(answer);
+            }
+        } else {
+            answer = String(answer);
+        }
+
+        // Convert newlines to <br> tags with bullet points for multi-line content
+        if (answer.includes('\n')) {
+            answer = answer.split('\n')
+                .map(line => line.trim())
+                .filter(line => line.length > 0)
+                .map(line => `• ${line}`)
+                .join('<br>');
+        }
+
+        qaDict[question] = {
+            question: question,
+            answer: answer,
+            evidenceId: evidence.evidenceId,
+            externalId: externalId,
+            source: evidence.source
+        };
+    });
+
+    return qaDict;
 }
 
 // Update the processData function to handle the merged evidence
 async function processData() {
     appState.tableData = [];
+    appState.qaData = {};
     console.log('Processing bundles...');
 
     for (const bundle of appState.bundles) {
@@ -321,11 +349,13 @@ async function processData() {
                 }
             });
         }
-        
-        // Log to see what data source we're using
-        console.log(`Bundle ${bundle.name} evidence sources:`, 
-            bundleEvidence.map(e => e.source).filter((v, i, a) => a.indexOf(v) === i)
-        );
+
+        // Extract Q/A dictionary for this bundle
+        const qaDict = extractQADictionary(bundle.id, bundleEvidence, bundle.policies);
+        appState.qaData[bundle.id] = qaDict;
+
+        // Log evidence count
+        console.log(`Bundle ${bundle.name}: ${bundleEvidence.length} evidence items (results only)`);
         // Collect model info from attachments
         for (const attachment of bundle.attachments || []) {
             if (attachment.type === 'ModelVersion' && attachment.identifier) {
@@ -335,25 +365,36 @@ async function processData() {
                 });
             }
         }
-        const modelHallucinationKey = Object.keys(bundleEvidenceMap).find(k => k.includes("Model-Upload-and-Hallucination"));
-        const modelHallucination = extractModelHallucination(bundleEvidenceMap[modelHallucinationKey]?.artifactContent);
-
-        // Extract metadata from evidence (same as before)
+        // Extract metadata from evidence using correct external IDs from your policy
         const metadata = {
-            applicationId: bundleEvidenceMap['system-id']?.artifactContent || null,
-            systemName: bundleEvidenceMap['system-name']?.artifactContent || null,
-            modelName: bundleEvidenceMap['system-name']?.artifactContent || null,
-            applicationType: bundleEvidenceMap['application-type']?.artifactContent || null,
-            serviceLevel: bundleEvidenceMap['service-level']?.artifactContent || null,
-            significanceRisk: bundleEvidenceMap['significance']?.artifactContent?.label || null,
-            usageRisk: bundleEvidenceMap['usage']?.artifactContent?.label || null,
-            complexityRisk: bundleEvidenceMap['complexity']?.artifactContent?.label || null,
-            userType: bundleEvidenceMap['user-type']?.artifactContent || null,
-            outputAuthorization: bundleEvidenceMap['output-authorization']?.artifactContent || null,
-            expiryDate: bundleEvidenceMap['expiry-date']?.artifactContent || null,
-            securityClassification: bundleEvidenceMap['Security-Classification-wa39']?.artifactContent || null,
-            euAIActRisk: bundleEvidenceMap['eu-ai-act-risk-level']?.artifactContent || null,
-            modelHealth: modelHallucination || null,
+            // Core model information
+            modelId: bundleEvidenceMap['model-id']?.artifactContent || null,
+            modelName: bundleEvidenceMap['model-name']?.artifactContent || null,
+            modelDescription: bundleEvidenceMap['model-description']?.artifactContent || null,
+            modelPurpose: bundleEvidenceMap['model-purpose']?.artifactContent || null,
+            modelStatus: bundleEvidenceMap['model-status']?.artifactContent || null,
+
+            // Business context
+            businessLine: bundleEvidenceMap['business-line']?.artifactContent || null,
+            businessUser: bundleEvidenceMap['business-user']?.artifactContent || null,
+
+            // People
+            modelOwner: bundleEvidenceMap['model-owner']?.artifactContent || null,
+            modelDeveloper: bundleEvidenceMap['model-developer']?.artifactContent || null,
+            modelValidator: bundleEvidenceMap['model-validator']?.artifactContent || null,
+
+            // Risk assessment
+            criticality: bundleEvidenceMap['criticality']?.artifactContent || null,
+            complexity: bundleEvidenceMap['complexity']?.artifactContent || null,
+            modelRiskTier: bundleEvidenceMap['model-risk-tier']?.artifactContent || null,
+            clearance: bundleEvidenceMap['clearance']?.artifactContent || null,
+
+            // Monitoring
+            monitoringFrequency: bundleEvidenceMap['monitoring-frequency']?.artifactContent || null,
+
+            // Validation artifacts
+            validationId: bundleEvidenceMap['validation-id']?.artifactContent || null,
+            eventType: bundleEvidenceMap['event-type']?.artifactContent || null,
         };
 
         // Collect QA and approval data
@@ -393,6 +434,9 @@ async function processData() {
             stages: bundle.stages || []
         };
 
+        // Add Q/A data to row
+        bundleRowData.qaDict = qaDict;
+
         if (
           bundleRowData.modelName &&
           typeof bundleRowData.modelName === 'string' &&
@@ -403,6 +447,46 @@ async function processData() {
         }
         console.log('Bundle Row Data:', bundleRowData);
     }
+
+    // Sort tableData by modelId (M001, M002, etc.)
+    appState.tableData.sort((a, b) => {
+        const idA = a.modelId || '';
+        const idB = b.modelId || '';
+
+        // Extract numeric part from model IDs (e.g., "M001" -> 1)
+        const numA = parseInt(idA.replace(/\D/g, '')) || 0;
+        const numB = parseInt(idB.replace(/\D/g, '')) || 0;
+
+        // Sort by numeric part
+        if (numA !== numB) {
+            return numA - numB;
+        }
+
+        // Fallback to string comparison if numeric parts are equal
+        return idA.localeCompare(idB);
+    });
+
+    console.log('Table data sorted by modelId');
+
+    // IMPORTANT: Console log the Q/A dictionaries for inspection
+    console.log('=== Q/A DICTIONARIES FOR ALL BUNDLES ===');
+    console.log('Total bundles with Q/A data:', Object.keys(appState.qaData).length);
+
+    for (const [bundleId, qaDict] of Object.entries(appState.qaData)) {
+        const bundle = appState.bundles.find(b => b.id === bundleId);
+        console.log(`\n--- Bundle: ${bundle?.name || bundleId} ---`);
+        console.log('Q/A Dictionary:', qaDict);
+
+        // Also log in a more readable format
+        console.log('Questions and Answers:');
+        for (const [key, value] of Object.entries(qaDict)) {
+            console.log(`  Q: ${value.question}`);
+            console.log(`  A: ${value.answer}`);
+            console.log(`  External ID: ${value.externalId}`);
+            console.log('  ---');
+        }
+    }
+    console.log('=== END Q/A DICTIONARIES ===\n');
 
     console.log('All bundles processed:', {
         totalBundles: appState.tableData.length,
@@ -485,27 +569,39 @@ function renderTable() {
         return;
     }
     
-    tbody.innerHTML = appState.tableData.map((model, index) => `
+    tbody.innerHTML = appState.tableData.map((model, index) => {
+        // Helper to convert newlines to <br> tags with bullet points for multi-line content
+        const nl2br = (str) => {
+            if (!str) return 'N/A';
+            const strVal = String(str);
+            // If there are newlines, add bullet points
+            if (strVal.includes('\n')) {
+                return strVal.split('\n')
+                    .map(line => line.trim())
+                    .filter(line => line.length > 0)
+                    .map(line => `• ${line}`)
+                    .join('<br>');
+            }
+            return strVal;
+        };
+
+        return `
         <tr>
             <td>
-                <div class="model-name">${model.modelName}</div>
-                <div class="model-type">ID: ${model.applicationId}</div>
+                <div class="model-name">${model.modelName || 'N/A'}</div>
+                <div class="model-type">${model.modelId || 'N/A'}</div>
             </td>
-            <td><span class="user-name">${model.applicationType}</span></td>
-            <td><span class="status-badge status-${model.serviceLevel?.toLowerCase().replace(/\s+/g, '-')}">${model.serviceLevel}</span></td>
-            <td><span class="risk-level" data-risk="${model.significanceRisk}">${model.significanceRisk}</span></td>
-            <td><span class="risk-level" data-risk="${model.usageRisk}">${model.usageRisk}</span></td>
-            <td><span class="risk-level" data-risk="${model.complexityRisk}">${model.complexityRisk}</span></td>
-            <td><span class="user-name">${model.userType}</span></td>
-            <td>
-              ${Array.isArray(model.outputAuthorization)
-                  ? model.outputAuthorization.map(item => `<span class="pill">${item}</span>`).join('')
-                  : `<span class="user-name">${model.outputAuthorization}</span>`}
-            </td>
-            <td><span class="user-name">${model.expiryDate}</span></td>
-            <td><span class="user-name">${model.securityClassification}</span></td>
-            <td><span class="user-name">${model.euAIActRisk}</span></td>
-            <td><span class="user-name">${model.modelHealth ?? '-'}</span></td>
+            <td><span class="user-name">${model.validationId || 'N/A'}</span></td>
+            <td><span class="user-name">${nl2br(model.businessLine)}</span></td>
+            <td><span class="status-badge status-${model.criticality?.toLowerCase().replace(/\s+/g, '-')}">${model.criticality || 'N/A'}</span></td>
+            <td><span class="status-badge status-${model.complexity?.toLowerCase().replace(/\s+/g, '-')}">${model.complexity || 'N/A'}</span></td>
+            <td><span class="user-name">${model.modelStatus || 'N/A'}</span></td>
+            <td><span class="user-name">${nl2br(model.modelOwner)}</span></td>
+            <td><span class="user-name">${nl2br(model.modelDeveloper)}</span></td>
+            <td><span class="user-name">${nl2br(model.modelValidator)}</span></td>
+            <td><span class="user-name">${model.monitoringFrequency || 'N/A'}</span></td>
+            <td><span class="risk-level" data-risk="${model.modelRiskTier}">${model.modelRiskTier || 'N/A'}</span></td>
+            <td><span class="risk-level" data-risk="${model.clearance}">${model.clearance || 'N/A'}</span></td>
             <td>
                 <button class="action-btn" onclick="toggleDetails(this, ${index})">
                     <span>Details</span>
@@ -539,6 +635,26 @@ function renderTable() {
                             ` : ''}
                         </div>
                     </div>
+                    ${model.qaDict && Object.keys(model.qaDict).length > 0 ? `
+                        <div class="detail-section">
+                            <h3>Evidence Questions & Answers</h3>
+                            <div class="qa-container">
+                                ${Object.values(model.qaDict).map(qa => `
+                                    <div class="qa-item">
+                                        <div class="qa-question">
+                                            <strong>Q:</strong> ${qa.question}
+                                        </div>
+                                        <div class="qa-answer">
+                                            <strong>A:</strong> ${qa.answer}
+                                        </div>
+                                        <div class="qa-meta">
+                                            <small>Source: ${qa.source} ${qa.externalId ? `| ID: ${qa.externalId}` : ''}</small>
+                                        </div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    ` : '<div class="detail-section"><p>No Q/A data available</p></div>'}
                         <div class="actions-row">
                             <button class="btn btn-primary" disabled>View Live Model Monitoring (disabled) </button>
                             <button class="btn btn-secondary" disabled>View Governing Bundles (disabled) </button>
@@ -547,7 +663,8 @@ function renderTable() {
                 </div>
             </td>
         </tr>
-    `).join('');
+        `;
+    }).join('');
 }
 
 function showLoading() {
@@ -601,7 +718,8 @@ function filterByStatus(status) {
         if (status === 'all') {
             row.style.display = '';
         } else {
-            const statusCell = row.querySelector('.status-badge');
+            // Model Status is in the 6th column (index 5)
+            const statusCell = row.querySelectorAll('td')[5];
             const matches = statusCell?.textContent.toLowerCase().includes(status.toLowerCase());
             row.style.display = matches ? '' : 'none';
         }
