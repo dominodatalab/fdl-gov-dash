@@ -322,11 +322,52 @@ function extractQADictionary(bundleId, bundleEvidence, bundlePolicies) {
             answer: answer,
             evidenceId: evidence.evidenceId,
             externalId: externalId,
-            source: evidence.source
+            source: evidence.source,
+            rawContent: evidence.artifactContent // Keep raw content for file extraction
         };
     });
 
     return qaDict;
+}
+
+// Helper function to extract all files from Q/A dictionary
+function extractFilesFromQA(qaDict) {
+    const files = [];
+
+    for (const [question, qaObj] of Object.entries(qaDict)) {
+        const rawContent = qaObj.rawContent;
+
+        // Try to parse as file structure
+        let parsed = null;
+        try {
+            if (typeof rawContent === 'object' && rawContent !== null) {
+                parsed = rawContent;
+            } else if (typeof rawContent === 'string') {
+                const trimmed = rawContent.trim();
+                if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+                    parsed = JSON.parse(trimmed);
+                }
+            }
+        } catch {
+            // Not JSON, skip
+            continue;
+        }
+
+        // Check if it has files
+        if (parsed && parsed.files && Array.isArray(parsed.files) && parsed.files.length > 0) {
+            parsed.files.forEach(file => {
+                files.push({
+                    name: file.name || 'Unknown file',
+                    path: file.path,
+                    sizeLabel: file.sizeLabel || '',
+                    question: question, // Track which Q/A this came from
+                    commit: parsed.commit
+                });
+            });
+        }
+    }
+
+    return files;
 }
 
 // Update the processData function to handle the merged evidence
@@ -420,6 +461,7 @@ async function processData() {
             attachmentModels: attachmentModels,
             modelNames: attachmentModels.map(m => m.name).join(', ') || 'N/A',
             modelVersions: attachmentModels.map(m => m.version).join(', ') || 'N/A',
+            attachments: bundle.attachments || [], // All attachments for documents section
             
             // Metadata
             ...metadata,
@@ -436,6 +478,9 @@ async function processData() {
 
         // Add Q/A data to row
         bundleRowData.qaDict = qaDict;
+
+        // Extract all files from Q/A evidence
+        bundleRowData.evidenceFiles = extractFilesFromQA(qaDict);
 
         if (
           bundleRowData.modelName &&
@@ -543,13 +588,76 @@ function getEvidenceExternalId(evidence, bundlePolicies) {
     for (const policy of bundlePolicies || []) {
         const fullPolicy = appState.policies[policy.policyId];
         if (!fullPolicy?.stages) continue;
-        
+
         for (const stage of fullPolicy.stages) {
             const evidenceDef = stage.evidenceSet?.find(def => def.id === evidence.evidenceId);
             if (evidenceDef) return evidenceDef.externalId;
         }
     }
     return null;
+}
+
+// Helper function to parse file JSON and create link HTML
+function parseFileAnswer(answer, projectOwner, projectName) {
+    // Try to parse as JSON
+    let parsed;
+    try {
+        const trimmed = answer.trim();
+        if ((trimmed.startsWith('{') && trimmed.endsWith('}'))) {
+            parsed = JSON.parse(trimmed);
+        } else {
+            return answer; // Not JSON, return as-is
+        }
+    } catch {
+        return answer; // Not valid JSON, return as-is
+    }
+
+    // Check if it has the file structure
+    if (parsed && parsed.files && Array.isArray(parsed.files)) {
+        if (parsed.files.length === 0) {
+            // If it has a commit but no files, show commit info
+            if (parsed.commit) {
+                return `<span class="commit-info">📌 Commit: <code>${parsed.commit.substring(0, 8)}</code> (no files)</span>`;
+            }
+            return '<span class="no-files">No files uploaded</span>';
+        }
+
+        let result = '<div class="file-links-container">';
+
+        // Create links for each file FIRST (these are the actual answers)
+        result += parsed.files.map(file => {
+            const fileName = file.name || 'Unknown file';
+            const filePath = file.path;
+            const fileSize = file.sizeLabel || '';
+
+            if (filePath && projectOwner && projectName) {
+                // URL encode the path
+                const encodedPath = encodeURIComponent(filePath);
+                const fileUrl = `https://se-demo.domino.tech/u/${projectOwner}/${projectName}/view-file/${encodedPath}`;
+
+                return `<a href="${fileUrl}" target="_blank" class="file-link" title="Open ${fileName} in new tab">
+                    <span class="file-icon">📄</span>
+                    <span class="file-name">${fileName}</span>
+                    ${fileSize ? `<span class="file-size">(${fileSize})</span>` : ''}
+                    <span class="file-arrow">↗</span>
+                </a>`;
+            } else {
+                return `<span class="file-info">📄 ${fileName} ${fileSize ? `(${fileSize})` : ''}</span>`;
+            }
+        }).join('');
+
+        result += '</div>';
+
+        // Add commit info as a footnote at the bottom if present
+        if (parsed.commit) {
+            result += `<div class="commit-info">📌 Commit: <code>${parsed.commit.substring(0, 8)}</code></div>`;
+        }
+
+        return result;
+    }
+
+    // Not a file structure, return original
+    return answer;
 }
 
 // Enhanced rendering function with security scan button
@@ -603,17 +711,25 @@ function renderTable() {
             <td><span class="risk-level" data-risk="${model.modelRiskTier}">${model.modelRiskTier || 'N/A'}</span></td>
             <td><span class="risk-level" data-risk="${model.clearance}">${model.clearance || 'N/A'}</span></td>
             <td>
-                <button class="action-btn" onclick="toggleDetails(this, ${index})">
-                    <span>Details</span>
-                    <span class="arrow">▼</span>
-                </button>
+                <div class="actions-cell">
+                    <a href="https://se-demo.domino.tech/u/${model.projectOwner}/${model.projectName}/governance/bundle/${model.bundleId}/policy/${model.policyId}/evidence"
+                       target="_blank"
+                       class="bundle-link"
+                       title="Open bundle in new tab">
+                        Bundle ↗
+                    </a>
+                    <button class="action-btn" onclick="toggleDetails(this, ${index})">
+                        <span>Details</span>
+                        <span class="arrow">▼</span>
+                    </button>
+                </div>
             </td>
         </tr>
         <tr id="details-${index}" class="expandable-row">
             <td colspan="13">
                 <div class="expandable-content">
                     <div class="detail-section">
-                        <h3>Model Details</h3>
+                        <h3 class="section-header">Model Details</h3>
                         <div class="detail-grid">
                             <div class="detail-item">
                                 <div class="detail-label">Primary Policy Name</div>
@@ -624,7 +740,7 @@ function renderTable() {
                                 <div class="detail-value">${model.policyId}</div>
                             </div>
                             <div class="detail-item">
-                                <div class="detail-label">Bundle</div>
+                                <div class="detail-label">Bundle Name</div>
                                 <div class="detail-value">${model.bundleName}</div>
                             </div>
                             ${model.experimentId ? `
@@ -637,34 +753,124 @@ function renderTable() {
                     </div>
                     ${model.qaDict && Object.keys(model.qaDict).length > 0 ? `
                         <div class="detail-section">
-                            <h3>Evidence Questions & Answers</h3>
-                            <div class="qa-container">
-                                ${Object.values(model.qaDict).map(qa => `
-                                    <div class="qa-item">
-                                        <div class="qa-question">
-                                            <strong>Q:</strong> ${qa.question}
-                                        </div>
-                                        <div class="qa-answer">
-                                            <strong>A:</strong> ${qa.answer}
-                                        </div>
-                                        <div class="qa-meta">
-                                            <small>Source: ${qa.source} ${qa.externalId ? `| ID: ${qa.externalId}` : ''}</small>
-                                        </div>
+                            <div class="section-header-row">
+                                <div class="section-header-left">
+                                    <h3 class="section-header">Evidence Questions & Answers</h3>
+                                    <button class="qa-toggle-btn" onclick="toggleQASection(${index})">
+                                        <span id="qa-toggle-icon-${index}">▼</span>
+                                    </button>
+                                </div>
+                                <button class="btn btn-secondary btn-copy-qa" onclick="copyQAToClipboard(${index}, event)">
+                                    Copy All Q/A
+                                </button>
+                            </div>
+                            <div id="qa-content-${index}" class="qa-collapsible-content" style="display: block;">
+                                <div class="qa-pagination-wrapper">
+                                    <div id="qa-container-${index}" class="qa-container" data-current-page="0">
+                                        ${Object.values(model.qaDict).map((qa, qaIndex) => {
+                                            const parsedAnswer = parseFileAnswer(qa.answer, model.projectOwner, model.projectName);
+                                            return `
+                                            <div class="qa-item" data-qa-index="${qaIndex}">
+                                                <div class="qa-question">${qa.question}</div>
+                                                <div class="qa-answer">${parsedAnswer}</div>
+                                            </div>
+                                        `;
+                                        }).join('')}
                                     </div>
-                                `).join('')}
+                                    ${Object.keys(model.qaDict).length > 4 ? `
+                                        <div class="qa-pagination-controls">
+                                            <button class="qa-pagination-btn qa-prev" onclick="changeQAPage(${index}, -1)" disabled>
+                                                ← Previous
+                                            </button>
+                                            <div class="qa-pagination-info">
+                                                <span id="qa-page-info-${index}">Page 1 of ${Math.ceil(Object.keys(model.qaDict).length / 4)}</span>
+                                            </div>
+                                            <button class="qa-pagination-btn qa-next" onclick="changeQAPage(${index}, 1)">
+                                                Next →
+                                            </button>
+                                        </div>
+                                    ` : ''}
+                                </div>
                             </div>
                         </div>
                     ` : '<div class="detail-section"><p>No Q/A data available</p></div>'}
+
+                    ${(model.policies && model.policies.length > 0) || (model.attachments && model.attachments.length > 0) ? `
+                        <div class="detail-section">
+                            <div class="two-column-section">
+                                <!-- Left Column: Underlying Policies -->
+                                <div class="column-left">
+                                    <h3 class="section-header">Underlying Policies</h3>
+                                    ${model.policies && model.policies.length > 0 ? `
+                                        <div class="policies-container">
+                                            ${model.policies.map(policy => `
+                                                <a href="https://se-demo.domino.tech/governance/policy/${policy.policyId}/ui-editor"
+                                                   target="_blank"
+                                                   class="policy-link"
+                                                   title="Open ${policy.policyName} in new tab">
+                                                    <span class="policy-name">${policy.policyName}</span>
+                                                    <span class="policy-arrow">↗</span>
+                                                </a>
+                                            `).join('')}
+                                        </div>
+                                    ` : '<p class="no-data">No policies attached</p>'}
+                                </div>
+
+                                <!-- Right Column: Attached Documents -->
+                                <div class="column-right">
+                                    <h3 class="section-header">Attached Documents</h3>
+                                    ${model.evidenceFiles && model.evidenceFiles.length > 0 ? `
+                                        <div class="policies-container">
+                                            ${model.evidenceFiles.map(file => {
+                                                const fileName = file.name;
+                                                const filePath = file.path;
+                                                const fileSize = file.sizeLabel;
+                                                const question = file.question;
+
+                                                // Create link to file
+                                                let href = '#';
+                                                let linkTitle = `From: ${question}`;
+
+                                                if (filePath && model.projectOwner && model.projectName) {
+                                                    const encodedPath = encodeURIComponent(filePath);
+                                                    href = `https://se-demo.domino.tech/u/${model.projectOwner}/${model.projectName}/view-file/${encodedPath}`;
+                                                }
+
+                                                return `
+                                                    <a href="${href}"
+                                                       target="_blank"
+                                                       class="policy-link document-link"
+                                                       title="${linkTitle}">
+                                                        <span class="policy-name">
+                                                            ${fileName}
+                                                            ${fileSize ? `<span class="doc-size">(${fileSize})</span>` : ''}
+                                                        </span>
+                                                        <span class="policy-arrow">↗</span>
+                                                    </a>
+                                                `;
+                                            }).join('')}
+                                        </div>
+                                    ` : '<p class="no-data">No documents attached</p>'}
+                                </div>
+                            </div>
+                        </div>
+                    ` : ''}
+
+                    <div class="detail-section">
+                        <h3 class="section-header">User Actions</h3>
                         <div class="actions-row">
                             <button class="btn btn-primary" disabled>View Live Model Monitoring (disabled) </button>
-                            <button class="btn btn-secondary" disabled>View Governing Bundles (disabled) </button>
                             <button class="btn btn-secondary" disabled>Run Security Scan (disabled) / Version</button>
+                        </div>
                     </div>
                 </div>
             </td>
         </tr>
         `;
     }).join('');
+
+    // Initialize pagination after rendering
+    setTimeout(() => initializeQAPagination(), 0);
 }
 
 function showLoading() {
@@ -689,12 +895,217 @@ function formatDate(date) {
     return date ? new Date(date).toLocaleDateString() : 'Unknown';
 }
 
+// Q&A Section Functions
+function toggleQASection(index) {
+    const content = document.getElementById(`qa-content-${index}`);
+    const icon = document.getElementById(`qa-toggle-icon-${index}`);
+
+    if (content.style.display === 'none') {
+        content.style.display = 'block';
+        icon.textContent = '▼';
+    } else {
+        content.style.display = 'none';
+        icon.textContent = '▶';
+    }
+}
+
+function changeQAPage(bundleIndex, direction) {
+    const container = document.getElementById(`qa-container-${bundleIndex}`);
+    const items = Array.from(container.querySelectorAll('.qa-item'));
+    const itemsPerPage = 4; // 2 rows x 2 columns (responsive)
+    const totalPages = Math.ceil(items.length / itemsPerPage);
+
+    let currentPage = parseInt(container.dataset.currentPage || 0);
+    currentPage += direction;
+
+    // Clamp to valid range
+    currentPage = Math.max(0, Math.min(currentPage, totalPages - 1));
+    container.dataset.currentPage = currentPage;
+
+    // Hide all items
+    items.forEach(item => item.style.display = 'none');
+
+    // Show items for current page
+    const startIndex = currentPage * itemsPerPage;
+    const endIndex = Math.min(startIndex + itemsPerPage, items.length);
+
+    for (let i = startIndex; i < endIndex; i++) {
+        items[i].style.display = 'block';
+    }
+
+    // Update pagination controls
+    const detailsRow = container.closest('.expandable-row');
+    const prevBtn = detailsRow.querySelector('.qa-prev');
+    const nextBtn = detailsRow.querySelector('.qa-next');
+    const pageInfo = document.getElementById(`qa-page-info-${bundleIndex}`);
+
+    if (prevBtn) prevBtn.disabled = currentPage === 0;
+    if (nextBtn) nextBtn.disabled = currentPage === totalPages - 1;
+    if (pageInfo) pageInfo.textContent = `Page ${currentPage + 1} of ${totalPages}`;
+}
+
+// Initialize Q/A pagination on page load
+function initializeQAPagination() {
+    document.querySelectorAll('.qa-container[data-current-page]').forEach((container) => {
+        const items = Array.from(container.querySelectorAll('.qa-item'));
+        const itemsPerPage = 4;
+
+        // Hide all items except first page
+        items.forEach((item, index) => {
+            if (index >= itemsPerPage) {
+                item.style.display = 'none';
+            }
+        });
+    });
+}
+
+// Helper function to flatten JSON for Google Sheets compatibility
+function flattenJSONForSheets(value) {
+    // Try to detect and parse JSON
+    let parsed = null;
+
+    // If it's already an object, use it directly
+    if (typeof value === 'object' && value !== null) {
+        parsed = value;
+    } else if (typeof value === 'string') {
+        // Try to parse as JSON
+        const trimmed = value.trim();
+        if ((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+            (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+            try {
+                parsed = JSON.parse(trimmed);
+            } catch {
+                // Not valid JSON, treat as regular string
+                return value;
+            }
+        } else {
+            return value;
+        }
+    } else {
+        return String(value);
+    }
+
+    // Now flatten the parsed object
+    if (Array.isArray(parsed)) {
+        // Handle arrays
+        if (parsed.length === 0) return '';
+
+        // If array of objects, extract key-value pairs
+        if (typeof parsed[0] === 'object') {
+            return parsed.map(item => {
+                const pairs = Object.entries(item)
+                    .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+                    .join('; ');
+                return pairs;
+            }).join(' | ');
+        }
+
+        // Simple array
+        return parsed.join(', ');
+    } else if (typeof parsed === 'object') {
+        // Handle objects - flatten to key=value pairs
+        const entries = Object.entries(parsed);
+
+        // Special handling for common patterns
+        if (parsed.commit) {
+            // Supporting Code pattern
+            const parts = [];
+            if (parsed.commit) parts.push(`commit=${parsed.commit}`);
+            if (parsed.files && Array.isArray(parsed.files) && parsed.files.length > 0) {
+                parts.push(`files=${parsed.files.map(f => f.name || f).join(', ')}`);
+            }
+            if (parsed.directories && Array.isArray(parsed.directories) && parsed.directories.length > 0) {
+                parts.push(`directories=${parsed.directories.join(', ')}`);
+            }
+            return parts.join('; ');
+        } else if (parsed.files && !parsed.commit) {
+            // Model Validation Report / Monitoring Report pattern
+            if (Array.isArray(parsed.files) && parsed.files.length > 0) {
+                return parsed.files.map(f => {
+                    if (typeof f === 'object') {
+                        return `${f.name || f.path || 'file'} (${f.sizeLabel || ''})`.trim();
+                    }
+                    return f;
+                }).join(', ');
+            }
+            return '';
+        }
+
+        // Generic object - flatten to key=value
+        return entries
+            .map(([key, val]) => {
+                if (val === null || val === undefined) return null;
+                if (Array.isArray(val)) {
+                    if (val.length === 0) return null;
+                    return `${key}=${val.join(', ')}`;
+                }
+                if (typeof val === 'object') {
+                    return `${key}=${JSON.stringify(val)}`;
+                }
+                return `${key}=${val}`;
+            })
+            .filter(x => x !== null)
+            .join('; ');
+    }
+
+    return String(parsed);
+}
+
+function copyQAToClipboard(index, event) {
+    const model = appState.tableData[index];
+    if (!model || !model.qaDict) {
+        alert('No Q/A data available');
+        return;
+    }
+
+    // Build CSV format: Question,Answer (copy ALL items, not just visible ones)
+    let csvContent = 'Question,Answer\n';
+
+    for (const [question, qaObj] of Object.entries(model.qaDict)) {
+        // Clean up HTML tags and format for CSV
+        const cleanQuestion = question.replace(/"/g, '""');
+
+        // First, flatten any JSON in the answer
+        let cleanAnswer = qaObj.answer
+            .replace(/<br>/g, ' | ')  // Replace <br> with pipe separator
+            .replace(/•/g, '')         // Remove bullet points
+            .trim();
+
+        // Flatten JSON objects to make them Sheets-friendly
+        cleanAnswer = flattenJSONForSheets(cleanAnswer);
+
+        // Now escape quotes for CSV
+        cleanAnswer = String(cleanAnswer).replace(/"/g, '""');
+
+        csvContent += `"${cleanQuestion}","${cleanAnswer}"\n`;
+    }
+
+    // Copy to clipboard
+    navigator.clipboard.writeText(csvContent).then(() => {
+        // Visual feedback
+        const button = event.target;
+        const originalText = button.textContent;
+        button.textContent = '✓ Copied All!';
+        button.style.background = 'var(--ok-bg)';
+        button.style.color = 'var(--ok-fg)';
+
+        setTimeout(() => {
+            button.textContent = originalText;
+            button.style.background = '';
+            button.style.color = '';
+        }, 2000);
+    }).catch(err => {
+        console.error('Failed to copy:', err);
+        alert('Failed to copy to clipboard');
+    });
+}
+
 // Event Handlers
 function toggleDetails(button, index) {
     const row = document.getElementById(`details-${index}`);
     const arrow = button.querySelector('.arrow');
     const isCurrentlyOpen = row.classList.contains('show');
-    
+
     // Close all other rows first
     document.querySelectorAll('.expandable-row.show').forEach(r => r.classList.remove('show'));
     document.querySelectorAll('.arrow.rotated').forEach(a => a.classList.remove('rotated'));
@@ -702,7 +1113,7 @@ function toggleDetails(button, index) {
         b.classList.remove('expanded');
         b.querySelector('span').textContent = 'Details';
     });
-    
+
     // If this row wasn't open, open it
     if (!isCurrentlyOpen) {
         row.classList.add('show');
